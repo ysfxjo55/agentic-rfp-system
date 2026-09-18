@@ -1,9 +1,86 @@
 import os
+import re
+import unicodedata
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import fitz  # PyMuPDF
 import docx
 from app.models.schemas import ExtractedBlock
+
+# Arabic Unicode ranges (standard block, supplement, presentation forms A/B)
+_ARABIC_CHAR_RE = re.compile(r'[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]')
+
+
+def _is_arabic_dominant(text: str) -> bool:
+    """True if Arabic characters make up a significant share of non-whitespace text."""
+    stripped = re.sub(r'\s+', '', text)
+    if not stripped:
+        return False
+    arabic_count = len(_ARABIC_CHAR_RE.findall(stripped))
+    return (arabic_count / len(stripped)) > 0.3
+
+
+def _fix_rtl_line(line_text: str) -> str:
+    """
+    Fallback text-only RTL correction for non-PDF sources (DOCX/TXT), where
+    no glyph coordinates are available. Reverses word order for Arabic-dominant
+    lines and applies NFKC normalization to collapse Arabic Presentation Form
+    ligatures (e.g. U+FEFB) back to standard letter sequences (e.g. "لا").
+    PDF extraction uses coordinate-based word reordering instead (see
+    `_reconstruct_pdf_line_from_words`), which is materially more reliable.
+    """
+    normalized = unicodedata.normalize('NFKC', line_text)
+    if not _is_arabic_dominant(normalized):
+        return normalized
+
+    tokens = normalized.split()
+    if len(tokens) <= 1:
+        return normalized
+    return " ".join(reversed(tokens))
+
+
+def _reconstruct_pdf_line_from_words(words: List[tuple]) -> str:
+    """
+    Reconstructs a physical PDF line's logical reading order from individual
+    word bounding boxes, rather than trusting the PDF content-stream order.
+    Some PDF generators (including this document's source, a Saudi government
+    tender portal) emit RTL Arabic word runs in visual (left-to-right screen
+    position) order rather than logical (right-to-left reading) order; sorting
+    by descending x-coordinate reconstructs the correct reading order directly
+    from physical layout, which is robust regardless of how the source PDF's
+    content stream ordered its glyphs.
+
+    `words` is a list of (x0, y0, x1, y1, word, block_no, line_no, word_no) tuples
+    for a single physical line, as returned by PyMuPDF's page.get_text("words").
+    """
+    combined = " ".join(w[4] for w in words)
+    combined_nfkc = unicodedata.normalize('NFKC', combined)
+    is_rtl = _is_arabic_dominant(combined_nfkc)
+    ordered = sorted(words, key=lambda w: -w[0] if is_rtl else w[0])
+
+    # Some Arabic glyphs (notably the lam-alef ligature "لا") get emitted by
+    # this PDF's font as a separate word-tuple mid-word rather than joined
+    # with its neighbors, splitting one logical word into 2-3 fragments (e.g.
+    # "وسلامة" -> "وس" / "ﻼ" / "مة"). These fragments sit almost exactly
+    # adjacent with near-zero physical gap, unlike genuine inter-word spacing
+    # (empirically ~3.5+ points in this document vs <1 point for a same-word
+    # split) — so join fragments directly (no space) when the gap is small,
+    # and insert a normal space otherwise.
+    GAP_THRESHOLD = 1.0
+    parts: List[str] = []
+    prev_edge: Optional[float] = None
+    for w in ordered:
+        x0, _, x1, *_rest = w[:4]
+        text = w[4]
+        if prev_edge is not None:
+            gap = (prev_edge - x1) if is_rtl else (x0 - prev_edge)
+            if gap >= GAP_THRESHOLD:
+                parts.append(" ")
+        parts.append(text)
+        prev_edge = x0 if is_rtl else x1
+
+    return unicodedata.normalize('NFKC', "".join(parts))
+
 
 class DocumentParserService:
     @staticmethod
@@ -60,27 +137,48 @@ class DocumentParserService:
             page = doc[page_num]
             # page_num is 0-indexed in fitz, so 1-indexed for citations
             page_index = page_num + 1
-            
-            # Extract text blocks with layout info
-            page_blocks = page.get_text("blocks")
-            
-            for b in page_blocks:
-                # b = (x0, y0, x1, y1, text, block_no, block_type)
-                text = b[4].strip()
-                if not text:
+
+            # Extract at word granularity (not "blocks"/"dict" text order) so each
+            # physical line can be reconstructed from actual glyph x-coordinates.
+            # Some PDF generators (including this document's source, a government
+            # tender portal) emit RTL Arabic word runs in visual/content-stream
+            # order rather than logical reading order; coordinate-based sorting
+            # reconstructs correct reading order regardless of stream order.
+            words = page.get_text("words")  # (x0, y0, x1, y1, word, block_no, line_no, word_no)
+
+            blocks_map: "Dict[int, Dict[int, List[tuple]]]" = {}
+            block_order: List[int] = []
+            for w in words:
+                block_no, line_no = w[5], w[6]
+                if block_no not in blocks_map:
+                    blocks_map[block_no] = {}
+                    block_order.append(block_no)
+                blocks_map[block_no].setdefault(line_no, []).append(w)
+
+            for block_no in block_order:
+                lines_map = blocks_map[block_no]
+                corrected_lines: List[str] = []
+                for line_no in sorted(lines_map.keys()):
+                    line_words = lines_map[line_no]
+                    line_text = _reconstruct_pdf_line_from_words(line_words).strip()
+                    if line_text:
+                        corrected_lines.append(line_text)
+
+                if not corrected_lines:
                     continue
+
+                text = "\n".join(corrected_lines)
 
                 # Heading detection heuristic:
                 # Short line (< 90 chars), doesn't end with a period, often capitalized or numbered
-                lines = text.split("\n")
-                first_line = lines[0].strip()
+                first_line = corrected_lines[0]
                 is_heading = False
 
                 if len(first_line) < 90 and (
                     first_line.isupper()
                     or any(first_line.startswith(prefix) for prefix in ["Section", "Part", "Chapter", "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9."])
                     or not first_line.endswith((".", ":", ";"))
-                ) and len(lines) <= 2:
+                ) and len(corrected_lines) <= 2:
                     current_section = first_line
                     is_heading = True
 
@@ -105,7 +203,7 @@ class DocumentParserService:
         word_count = 0
 
         for p in doc.paragraphs:
-            text = p.text.strip()
+            text = _fix_rtl_line(p.text.strip())
             if not text:
                 continue
 
@@ -150,7 +248,7 @@ class DocumentParserService:
     @classmethod
     def _parse_text(cls, file_path: str) -> List[ExtractedBlock]:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = [line.strip() for line in f.readlines()]
+            lines = [_fix_rtl_line(line.strip()) for line in f.readlines()]
 
         blocks_out: List[ExtractedBlock] = []
         current_section = "General Information"

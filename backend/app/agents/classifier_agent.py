@@ -240,20 +240,52 @@ def _determine_category(text: str, section: str) -> tuple[str, str]:
     return "Technical", "Clause specifies architectural, technical infrastructure, software functionality, or performance criteria"
 
 
+_ARABIC_DIACRITICS_RE = re.compile(r'[ً-ْٰ]')
+
+# Arabic obligation (mandatory) phrases. Word order/spacing between the two-word
+# phrases uses \s+ since PDF-extracted Arabic text can carry irregular internal
+# whitespace from font kerning artifacts. Diacritics are stripped from the input
+# before matching (see _determine_mandatory), so patterns are written undiacritized.
+_AR_MANDATORY_PATTERN = re.compile(
+    r'(?:يجب\s+على|يجب|يلتزم|يشترط|لا\s+يجوز|يحظر|على\s+المتنافس|على\s+المتعاقد|'
+    r'شريطة|لا\s+يعتد\s+ب|يستبعد\s+العرض|لا\s+يتجاوز|لا\s+يزيد)'
+)
+# Arabic optional/discretionary phrases. "يجوز" alone (without a negation) typically
+# grants discretionary power to the issuing entity rather than binding the bidder;
+# these are intentionally bucketed as optional/non-binding per that distinction.
+_AR_OPTIONAL_PATTERN = re.compile(
+    r'(?:يجوز\s+للجهة|يفضل|يمكن|للهيئة\s+الحق|يحق\s+ل|يجوز)'
+)
+
+
+def _strip_arabic_diacritics(text: str) -> str:
+    return _ARABIC_DIACRITICS_RE.sub('', text)
+
+
 def _determine_mandatory(text: str) -> tuple[bool, str, float, str]:
     """
-    Evaluates mandatory vs optional status based on explicit modal evidence.
+    Evaluates mandatory vs optional status based on explicit modal evidence,
+    in both English (RFC 2119 style) and Arabic obligation language.
     Returns (is_mandatory, priority, mandatory_confidence, mandatory_reasoning).
 
-    1. Explicit Mandatory: MUST, SHALL, MANDATORY, REQUIRED, IS REQUIRED TO, CANNOT, AGREES TO
+    1. Explicit Mandatory:
+       EN: MUST, SHALL, MANDATORY, REQUIRED, IS REQUIRED TO, CANNOT, AGREES TO
+       AR: يجب, يجب على, يلتزم, يشترط, لا يجوز, يحظر, على المتنافس, على المتعاقد,
+           شريطة, لا يعتد بـ, يستبعد العرض
        -> is_mandatory = True, priority = "High", mandatory_confidence = 1.0
-    2. Explicit Optional: SHOULD, MAY, OPTIONAL, PREFERABLE, DESIRABLE, NICE TO HAVE
+    2. Explicit Optional:
+       EN: SHOULD, MAY, OPTIONAL, PREFERABLE, DESIRABLE, NICE TO HAVE
+       AR: يجوز, يجوز للجهة, يُفضّل, يمكن, للهيئة الحق, يحق لـ
        -> is_mandatory = False, priority = "Low", mandatory_confidence = 1.0
     3. Ambiguous / No Modal:
        -> is_mandatory = False, priority = "Low", mandatory_confidence = 0.0
        (Does not automatically claim mandatory status; zero legal presumption)
+
+    When both an Arabic mandatory phrase (e.g. "لا يجوز") and the bare optional
+    phrase "يجوز" match the same text (since the mandatory phrase contains the
+    optional word as a substring), the mandatory determination takes precedence.
     """
-    text_lower = text.lower()
+    text_lower = _strip_arabic_diacritics(text.lower())
 
     mandatory_pattern = re.compile(
         r'\b(?:shall|must|mandatory|required|will\s+be\s+required|is\s+required\s+to|are\s+required\s+to|agrees\s+to|covenants|undertakes|cannot|strict\s+requirement)\b',
@@ -264,22 +296,22 @@ def _determine_mandatory(text: str) -> tuple[bool, str, float, str]:
         re.IGNORECASE
     )
 
-    mandatory_match = mandatory_pattern.search(text_lower)
-    optional_match = optional_pattern.search(text_lower)
+    mandatory_match = mandatory_pattern.search(text_lower) or _AR_MANDATORY_PATTERN.search(text_lower)
+    optional_match = optional_pattern.search(text_lower) or _AR_OPTIONAL_PATTERN.search(text_lower)
 
     if mandatory_match and not optional_match:
-        word = mandatory_match.group(0).upper()
+        word = mandatory_match.group(0).strip().upper()
         return True, "High", 1.0, f"Explicit mandatory evidence: Contains binding imperative '{word}'"
     elif optional_match and not mandatory_match:
-        word = optional_match.group(0).upper()
+        word = optional_match.group(0).strip().upper()
         return False, "Low", 1.0, f"Explicit optional evidence: Contains advisory modal '{word}'"
     elif mandatory_match and optional_match:
-        m_word = mandatory_match.group(0).upper()
-        o_word = optional_match.group(0).upper()
+        m_word = mandatory_match.group(0).strip().upper()
+        o_word = optional_match.group(0).strip().upper()
         return True, "High", 0.85, f"Explicit mandatory evidence: Primary imperative '{m_word}' with subordinate advisory '{o_word}'"
     else:
         # Ambiguous / no-modal: DO NOT claim it is mandatory
-        return False, "Low", 0.0, "Inferred/ambiguous status: Clause contains no explicit modal imperatives (SHALL, MUST, REQUIRED) or explicit advisory terms (SHOULD, MAY). Status cannot be determined with certainty from text alone."
+        return False, "Low", 0.0, "Inferred/ambiguous status: Clause contains no explicit modal imperatives (SHALL, MUST, REQUIRED / يجب، يشترط، على المتنافس) or explicit advisory terms (SHOULD, MAY / يجوز، يفضل). Status cannot be determined with certainty from text alone."
 
 
 def _normalize_category(category_name: str, text: str) -> str:

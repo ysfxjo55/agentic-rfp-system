@@ -55,6 +55,7 @@ const STATE_PRECEDENCE: Record<WorkflowState, number> = {
   ASSESSING_RISKS: 5,
   AWAITING_GO_NOGO: 6,
   ABORTED_NO_GO: 10,
+  EXTRACTION_FAILED: 10,
   WRITING_PROPOSAL: 7,
   REVISING: 7,
   REVIEWING: 8,
@@ -78,6 +79,7 @@ function toWorkflowState(val: string): WorkflowState {
     case 'ASSESSING_RISKS':
     case 'AWAITING_GO_NOGO':
     case 'ABORTED_NO_GO':
+    case 'EXTRACTION_FAILED':
     case 'WRITING_PROPOSAL':
     case 'REVISING':
     case 'REVIEWING':
@@ -116,6 +118,7 @@ export const RFPWorkspace: React.FC<Props> = ({ rfpId, onBack }) => {
   const isWorkflowCompleted =
     status?.status === 'APPROVED_FOR_EXPORT' ||
     status?.status === 'ABORTED_NO_GO' ||
+    status?.status === 'EXTRACTION_FAILED' ||
     status?.status === 'REJECTED';
 
   useEffect(() => {

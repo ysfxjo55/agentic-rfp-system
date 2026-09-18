@@ -169,6 +169,8 @@ async def run_workflow_async(rfp_id: str, file_path: str):
         "file_path": file_path,
         "metadata": None,
         "raw_clauses": [],
+        "evaluation_criteria_items": [],
+        "encoding_corrupted_pages": [],
         "requirements": [],
         "compliance_matrix": [],
         "overall_compliance_score": 0.0,

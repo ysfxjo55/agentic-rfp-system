@@ -501,8 +501,18 @@ def _build_safe_requirement_response(
         )
     else:  # INFORMATION_REQUIRED
         resp_type = "INFORMATION_REQUIRED_RESPONSE"
+        req_snippet = (req_text[:180] + "...") if len(req_text) > 180 else req_text
+        closest_match = (
+            f" The closest available company evidence found ('{evidence_text[:160]}'"
+            f"{'...' if evidence_text and len(evidence_text) > 160 else ''}' from {source_doc}) "
+            f"did not meet the confidence threshold to confirm compliance."
+            if evidence_text else
+            " No related company evidence was found in the knowledge base for this specific requirement."
+        )
+        reasoning_note = f" Compliance audit note: {notes}" if notes else ""
         response_text = (
-            f"Information Required: Verification data for {req_code} is currently unconfirmed in available company documentation. "
+            f"Information Required: For requirement {req_code} ('{req_snippet}'), verification data is currently "
+            f"unconfirmed in available company documentation.{closest_match}{reasoning_note} "
             f"Internal confirmation and supporting collateral (e.g. valid certificate or architecture specification) must be provided "
             f"by the internal bid/compliance team prior to final submission."
         )

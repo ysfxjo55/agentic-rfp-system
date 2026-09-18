@@ -466,6 +466,47 @@ def _run_deterministic_review_checks(
     if info_needed_count > 0:
         warnings.append(f"{info_needed_count} requirements have unconfirmed company documentation ([INFORMATION REQUIRED]).")
 
+    # --------------------------------------------------------------------------
+    # 6b. MANDATORY REQUIREMENT COMPLIANCE GATE
+    # --------------------------------------------------------------------------
+    # A proposal score is meaningless if it ignores how much of the MANDATORY
+    # scope is actually confirmed compliant: correctly labeling gaps as
+    # "[INFORMATION REQUIRED]" (rather than fabricating capability claims) is
+    # necessary but not sufficient for approval — the bid itself is not ready
+    # to submit while a large share of mandatory requirements remain unverified
+    # or non-compliant. This check is independent of, and in addition to, the
+    # per-item grounding checks above (which only catch DISHONEST responses,
+    # not HONEST-but-incomplete ones).
+    MANDATORY_UNCONFIRMED_BLOCK_THRESHOLD = 0.30
+    mandatory_reqs = [r for r in req_map.values() if r.get("is_mandatory")]
+    mandatory_compliant_count = len([
+        r for r in mandatory_reqs
+        if comp_map.get(r.get("req_code", ""), {}).get("status") == "COMPLIANT"
+    ])
+    mandatory_not_compliant_count = len(mandatory_reqs) - mandatory_compliant_count
+    mandatory_unconfirmed_ratio = (
+        mandatory_not_compliant_count / len(mandatory_reqs) if mandatory_reqs else 0.0
+    )
+
+    if mandatory_reqs and mandatory_unconfirmed_ratio > MANDATORY_UNCONFIRMED_BLOCK_THRESHOLD:
+        pct = round(mandatory_unconfirmed_ratio * 100)
+        block_msg = (
+            f"This proposal cannot be approved: {pct}% of mandatory requirements are "
+            f"unconfirmed by evidence from the knowledge base."
+        )
+        warnings.append(block_msg)
+        add_finding(
+            severity="CRITICAL",
+            category="MANDATORY_COMPLIANCE_GATE",
+            description=(
+                f"{mandatory_not_compliant_count}/{len(mandatory_reqs)} mandatory requirements "
+                f"({pct}%) are not confirmed COMPLIANT (INFORMATION_REQUIRED, NON_COMPLIANT, or "
+                f"PARTIALLY_COMPLIANT), exceeding the {int(MANDATORY_UNCONFIRMED_BLOCK_THRESHOLD * 100)}% "
+                f"threshold for bid readiness."
+            ),
+            rec_action=block_msg
+        )
+
     # Initial Draft v1 refinement directive:
     # An initial proposal draft containing unverified information items, risks, or open clarifications
     # requires at least one Red Team critique and revision cycle before final approval.
@@ -498,6 +539,13 @@ def _run_deterministic_review_checks(
             deduction_feasibility += pts
         else:
             deduction_clarity += pts
+
+    # Proportional deduction from the Compliance Alignment criterion based on how
+    # much of the MANDATORY scope is not confirmed COMPLIANT. This guarantees a
+    # score of 100/100 is mathematically impossible unless every mandatory
+    # requirement is actually COMPLIANT (none INFORMATION_REQUIRED, NON_COMPLIANT,
+    # or PARTIALLY_COMPLIANT) — regardless of how well-formatted the draft is.
+    deduction_comp += round(25 * mandatory_unconfirmed_ratio)
 
     score_comp = max(0, 25 - deduction_comp)
     score_grounding = max(0, 25 - deduction_grounding)

@@ -224,7 +224,13 @@ export const WorkflowVisualizer: React.FC<Props> = ({
       return 'disabled';
     }
 
-    // 2. Terminal workflow abort at Gate 1
+    // 2. Terminal extraction failure: halt before classification ever ran
+    if (workflowStatus === 'EXTRACTION_FAILED') {
+      if (node.id === 'extract') return 'failed';
+      return 'disabled';
+    }
+
+    // 2b. Terminal workflow abort at Gate 1
     if (workflowStatus === 'ABORTED_NO_GO') {
       if (node.id === 'gate1') return 'aborted';
       if (['writer', 'reviewer', 'gate2'].includes(node.id)) return 'disabled';
@@ -396,6 +402,18 @@ export const WorkflowVisualizer: React.FC<Props> = ({
               <h4 className="text-sm font-bold text-emerald-900">Proposal Approved for Export</h4>
               <p className="text-xs text-emerald-700 mt-0.5">
                 Draft v{Math.max(currentVersion, 1)} has passed human sign-off and is ready for export.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {workflowStatus === 'EXTRACTION_FAILED' && (
+          <div className="mb-6 p-4 rounded-xl border border-rose-300 bg-rose-50 text-rose-900 flex items-center gap-3 animate-in fade-in duration-200">
+            <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0" />
+            <div>
+              <h4 className="text-sm font-bold text-rose-900">Extraction Failed</h4>
+              <p className="text-xs text-rose-700 mt-0.5">
+                Extraction failed: no verifiable requirements were found. Check the file format or try a different one.
               </p>
             </div>
           </div>

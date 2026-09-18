@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     # LLM Settings
     LLM_PROVIDER: str = "openai"  # openai, gemini, or mock
     OPENAI_API_KEY: str = Field(default="")
-    OPENAI_MODEL: str = "gpt-4o-mini"
+    OPENAI_MODEL: str = "gpt-4.1"
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     
     GEMINI_API_KEY: str = Field(default="")

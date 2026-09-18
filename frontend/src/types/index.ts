@@ -43,6 +43,7 @@ export type WorkflowState =
   | 'ASSESSING_RISKS'
   | 'AWAITING_GO_NOGO'
   | 'ABORTED_NO_GO'
+  | 'EXTRACTION_FAILED'
   | 'WRITING_PROPOSAL'
   | 'REVISING'
   | 'REVIEWING'

@@ -33,6 +33,17 @@ def human_go_nogo_gate(state: RFPProposalState) -> Dict[str, Any]:
         "workflow_status": "WRITING_PROPOSAL"
     }
 
+def route_extraction_result(state: RFPProposalState) -> Literal["classify_requirements", "extraction_failed"]:
+    if state.get("workflow_status") == "EXTRACTION_FAILED":
+        return "extraction_failed"
+    return "classify_requirements"
+
+def extraction_failed_node(state: RFPProposalState) -> Dict[str, Any]:
+    return {
+        "active_agent": "System",
+        "workflow_status": "EXTRACTION_FAILED"
+    }
+
 def route_go_nogo(state: RFPProposalState) -> Literal["write_proposal", "abort_workflow"]:
     if state.get("go_nogo_decision") == "NO_GO":
         return "abort_workflow"
@@ -107,6 +118,7 @@ def create_rfp_graph():
 
     # Add agent and gate nodes
     workflow.add_node("extract_rfp", extract_rfp_node)
+    workflow.add_node("extraction_failed", extraction_failed_node)
     workflow.add_node("classify_requirements", classify_requirements_node)
     workflow.add_node("analyze_compliance", analyze_compliance_node)
     workflow.add_node("assess_risks", assess_risks_node)
@@ -118,7 +130,15 @@ def create_rfp_graph():
 
     # Core execution pipeline edges
     workflow.set_entry_point("extract_rfp")
-    workflow.add_edge("extract_rfp", "classify_requirements")
+    workflow.add_conditional_edges(
+        "extract_rfp",
+        route_extraction_result,
+        {
+            "classify_requirements": "classify_requirements",
+            "extraction_failed": "extraction_failed"
+        }
+    )
+    workflow.add_edge("extraction_failed", END)
     workflow.add_edge("classify_requirements", "analyze_compliance")
     workflow.add_edge("analyze_compliance", "assess_risks")
     workflow.add_edge("assess_risks", "human_go_nogo_gate")

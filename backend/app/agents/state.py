@@ -19,6 +19,8 @@ class RFPProposalState(TypedDict):
     # Ingestion & Extraction (Agent 1)
     metadata: Optional[Dict[str, Any]]
     raw_clauses: List[Dict[str, Any]]
+    evaluation_criteria_items: List[Dict[str, Any]]
+    encoding_corrupted_pages: List[int]
     
     # Requirement Classification (Agent 2)
     requirements: List[Dict[str, Any]]
@@ -58,6 +60,7 @@ class RFPProposalState(TypedDict):
         "ASSESSING_RISKS",
         "AWAITING_GO_NOGO",
         "ABORTED_NO_GO",
+        "EXTRACTION_FAILED",
         "WRITING_PROPOSAL",
         "REVIEWING",
         "REVISING",
