@@ -5,6 +5,7 @@ from app.agents.extractor_agent import (
     extract_rfp_node,
     _fallback_metadata,
     _sanitize_metadata,
+    _reject_llm_extracted_clause,
     PROHIBITED_FICTIONAL_STRINGS
 )
 from app.models.schemas import ExtractedBlock, RFPMetadata
@@ -306,3 +307,53 @@ def test_fallback_never_inserts_fictional_information():
     for prohibited in PROHIBITED_FICTIONAL_STRINGS:
         assert prohibited.lower() not in str(empty_meta.model_dump()).lower()
         assert prohibited.lower() not in str(random_meta.model_dump()).lower()
+
+
+def _diluted_arabic_batch_text() -> str:
+    """
+    Reproduces the real failure mode: a batch of several short Arabic clauses,
+    each prefixed with the English "[Block N | Page N | Section: ...]"
+    scaffolding _extract_all_clauses actually builds. The scaffolding text
+    outweighs the short Arabic clause text, so the BATCH itself reads as
+    non-Arabic-dominant even though every block in it is genuinely Arabic.
+    """
+    blocks = []
+    for i in range(1, 6):
+        header = f"[Block {i} | Page {i} | Section: Terms and Conditions Administrative Requirements]\n"
+        blocks.append(header + "يجب الالتزام")
+    return "\n\n".join(blocks)
+
+
+def test_reject_llm_clause_catches_translation_diluted_by_batch_scaffolding():
+    """
+    Regression test for the scaffolding-dilution bug: _reject_llm_extracted_clause
+    previously decided the source language from the per-batch text alone, but
+    that text is diluted by English "[Block N | Page N | Section: ...]"
+    headers. A batch of several short Arabic clauses could fall below the
+    Arabic-dominance threshold on its own, silently letting a translated
+    English clause through undetected even though the source document is
+    genuinely Arabic. Passing the document-level `doc_is_arabic` signal must
+    close that gap.
+    """
+    batch_text = _diluted_arabic_batch_text()
+    translated_clause = "The bidder must comply with all terms and conditions"
+
+    # Sanity check this test actually reproduces the diluted-batch condition.
+    from app.services.document_parser import _is_arabic_dominant
+    assert not _is_arabic_dominant(batch_text), "test fixture no longer reproduces the dilution bug"
+
+    # Without the document-level signal (doc_is_arabic defaults to False), the
+    # translation slips through undetected — this is the bug being fixed.
+    assert _reject_llm_extracted_clause(translated_clause, batch_text) is None
+
+    # With doc_is_arabic=True (computed once for the whole document), the same
+    # translated clause must now be rejected even though its own batch text
+    # reads as non-Arabic-dominant.
+    reason = _reject_llm_extracted_clause(translated_clause, batch_text, doc_is_arabic=True)
+    assert reason is not None
+    assert "translat" in reason.lower()
+
+    # A genuine, verbatim Arabic clause from the same diluted batch must NOT
+    # be rejected — the fix must not start flagging real Arabic content.
+    verbatim_arabic_clause = "يجب الالتزام بجميع الشروط والأحكام"
+    assert _reject_llm_extracted_clause(verbatim_arabic_clause, batch_text, doc_is_arabic=True) is None

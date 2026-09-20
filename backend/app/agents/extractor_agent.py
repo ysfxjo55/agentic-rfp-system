@@ -84,7 +84,9 @@ _INCOMPLETENESS_MARKER_PATTERN = re.compile(
 )
 
 
-def _reject_llm_extracted_clause(clause_text: str, source_batch_text: str) -> Optional[str]:
+def _reject_llm_extracted_clause(
+    clause_text: str, source_batch_text: str, doc_is_arabic: bool = False
+) -> Optional[str]:
     """
     Rejects an LLM-extracted clause that fails to be genuinely verbatim,
     returning a rejection reason (for logging) or None if the clause is fine.
@@ -93,11 +95,20 @@ def _reject_llm_extracted_clause(clause_text: str, source_batch_text: str) -> Op
     LLM call) then supplies a genuinely verbatim replacement for the same
     underlying content via the merge step in `_extract_all_clauses`.
 
-    1. Translation instead of verbatim extraction: if the source batch is
-       Arabic-dominant but the extracted clause is not, the model translated
-       rather than transcribed — unacceptable for a tender document that
-       itself requires Arabic-language submissions (a translated clause in
-       the proposal would expose the bid to formal disqualification).
+    1. Translation instead of verbatim extraction: if the document (or, as a
+       fallback, this batch) is Arabic-dominant but the extracted clause is
+       not, the model translated rather than transcribed — unacceptable for a
+       tender document that itself requires Arabic-language submissions (a
+       translated clause in the proposal would expose the bid to formal
+       disqualification).
+
+       `doc_is_arabic` is computed once from the raw block text for the whole
+       document and passed in, rather than relying solely on
+       `source_batch_text`: each batch is prefixed with English scaffolding
+       (`[Block N | Page N | Section: ...]`) and batches of short Arabic
+       clauses can fall below the Arabic-dominance threshold on their own,
+       which previously let translated English clauses through undetected on
+       those batches even though the source document is Arabic.
     2. Self-acknowledged incomplete extraction: if the model's own output
        contains a hedge like "(clause incomplete)", it is explicitly telling
        us the extraction is unreliable; such a clause must never be silently
@@ -106,7 +117,8 @@ def _reject_llm_extracted_clause(clause_text: str, source_batch_text: str) -> Op
     if _INCOMPLETENESS_MARKER_PATTERN.search(clause_text):
         return "self-annotated as incomplete/truncated by the extraction model"
 
-    if len(clause_text.strip()) >= 15 and _is_arabic_dominant(source_batch_text) and not _is_arabic_dominant(clause_text):
+    source_is_arabic = doc_is_arabic or _is_arabic_dominant(source_batch_text)
+    if len(clause_text.strip()) >= 15 and source_is_arabic and not _is_arabic_dominant(clause_text):
         return "translated to a different language instead of extracted verbatim from an Arabic source"
 
     return None
@@ -194,7 +206,7 @@ def extract_rfp_node(state: RFPProposalState) -> Dict[str, Any]:
     metadata = _extract_metadata(blocks)
 
     # 3. Extract Candidate Clauses across the ENTIRE document (Full-Document Strategy)
-    raw_clauses, evaluation_criteria_items, encoding_corrupted_pages = _extract_all_clauses(blocks)
+    raw_clauses, evaluation_criteria_items, encoding_corrupted_pages, rejected_translation_count = _extract_all_clauses(blocks)
 
     # 4. Final safety sanity check: ensure no prohibited fictional strings exist
     metadata = _sanitize_metadata(metadata)
@@ -240,13 +252,20 @@ def extract_rfp_node(state: RFPProposalState) -> Dict[str, Any]:
             f"were excluded rather than shown garbled — manual review of those pages is recommended."
         )
 
+    translation_warning = ""
+    if rejected_translation_count:
+        translation_warning = (
+            f" {rejected_translation_count} LLM-extracted clause(s) were rejected as translated "
+            f"rather than verbatim and replaced with rule-based (literal source-text) extraction."
+        )
+
     log_entry = {
         "agent": "Extraction Agent",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "action": (
             f"Extracted metadata and identified {len(raw_clauses)} candidate clauses "
             f"({len(evaluation_criteria_items)} evaluation-criteria fragments excluded) "
-            f"across {len(blocks)} blocks covering all pages.{encoding_warning}"
+            f"across {len(blocks)} blocks covering all pages.{encoding_warning}{translation_warning}"
         )
     }
 
@@ -612,7 +631,7 @@ def _fallback_metadata(blocks: List[ExtractedBlock], context_text: str, repeated
     )
 
 
-def _extract_all_clauses(blocks: List[ExtractedBlock]) -> Tuple[List[RawClause], List[Dict[str, Any]], List[int]]:
+def _extract_all_clauses(blocks: List[ExtractedBlock]) -> Tuple[List[RawClause], List[Dict[str, Any]], List[int], int]:
     """
     Extracts candidate clauses across the ENTIRE document (all pages).
     Processes blocks in batches to keep within context limits if LLM is active,
@@ -672,6 +691,16 @@ def _extract_all_clauses(blocks: List[ExtractedBlock]) -> Tuple[List[RawClause],
     llm = LLMFactory.get_chat_model()
     batches = _create_block_batches(blocks, max_blocks_per_batch=10, max_chars_per_batch=3500)
 
+    # Computed once from the full document's raw text (not per-batch): a batch
+    # of short Arabic clauses, once prefixed with English "[Block N | Page N |
+    # Section: ...]" scaffolding, can itself fall below the Arabic-dominance
+    # threshold even though the source document is genuinely Arabic. Passing
+    # this document-level signal into _reject_llm_extracted_clause closes that
+    # gap so a translated clause is never let through just because its own
+    # batch happened to read as non-Arabic-dominant.
+    doc_is_arabic = _is_arabic_dominant(" ".join(b.text for b in blocks))
+    rejected_translation_count = 0
+
     # 1. LLM Batch Extraction (if available)
     if llm:
         for batch in batches:
@@ -705,8 +734,10 @@ def _extract_all_clauses(blocks: List[ExtractedBlock]) -> Tuple[List[RawClause],
                 ])
                 if batch_result and batch_result.clauses:
                     for c in batch_result.clauses:
-                        rejection_reason = _reject_llm_extracted_clause(c.text, batch_text)
+                        rejection_reason = _reject_llm_extracted_clause(c.text, batch_text, doc_is_arabic)
                         if rejection_reason:
+                            if "translated" in rejection_reason:
+                                rejected_translation_count += 1
                             print(
                                 f"[Agent 1: Extraction] Rejected LLM clause ({rejection_reason}), "
                                 f"deferring to rule-based extraction for this content: {c.text[:80]!r}"
@@ -774,7 +805,7 @@ def _extract_all_clauses(blocks: List[ExtractedBlock]) -> Tuple[List[RawClause],
         )
         idx += 1
 
-    return formatted_clauses, evaluation_criteria_items, sorted(encoding_corrupted_pages)
+    return formatted_clauses, evaluation_criteria_items, sorted(encoding_corrupted_pages), rejected_translation_count
 
 
 def _extract_clauses_rule_based(blocks: List[ExtractedBlock]) -> List[RawClause]:

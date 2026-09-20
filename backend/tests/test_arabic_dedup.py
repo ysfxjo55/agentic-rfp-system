@@ -83,7 +83,7 @@ def rule_based_clauses():
     deterministic rule-based path only — reproducible on any machine."""
     with patch("app.agents.llm_factory.LLMFactory.get_chat_model", return_value=None):
         blocks = DocumentParserService.parse_document(str(FIXTURE))
-        formatted, eval_items, corrupt_pages = _extract_all_clauses(blocks)
+        formatted, eval_items, corrupt_pages, _rejected_translations = _extract_all_clauses(blocks)
     return formatted, eval_items, corrupt_pages
 
 
