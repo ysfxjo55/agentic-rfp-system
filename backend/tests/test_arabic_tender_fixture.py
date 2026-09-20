@@ -56,7 +56,7 @@ def tender_pipeline_result():
             f"[{b.section_title} - Page {b.page_number}]\n{b.text}" for b in intro_blocks
         )[:6000]
         metadata = _fallback_metadata(blocks, context_text, repeated_lines)
-        raw_clauses, evaluation_criteria_items, encoding_corrupted_pages = _extract_all_clauses(blocks)
+        raw_clauses, evaluation_criteria_items, encoding_corrupted_pages, _rejected_translations = _extract_all_clauses(blocks)
         classified = _classify_all_clauses([c.model_dump() for c in raw_clauses])
         requirements = _assign_canonical_ids(classified)
 
