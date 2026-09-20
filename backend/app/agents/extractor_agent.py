@@ -622,31 +622,52 @@ def _extract_all_clauses(blocks: List[ExtractedBlock]) -> Tuple[List[RawClause],
     raw_clauses: List[RawClause] = []
     seen_signatures: Set[str] = set()
     kept_sig_list: List[str] = []
+    kept_token_sets: List[Set[str]] = []
 
-    def _is_duplicate(norm_sig: str) -> bool:
+    # Conservative fuzzy-dedup settings: two clauses are treated as the same
+    # only when their content-token overlap is high AND both carry enough
+    # tokens to make that overlap meaningful. Set intentionally high (0.82) so
+    # that genuinely distinct obligations sharing vocabulary (very common in a
+    # legal tender) are NOT merged — losing a real requirement is worse than
+    # keeping a near-duplicate.
+    JACCARD_DUP_THRESHOLD = 0.82
+    MIN_TOKENS_FOR_FUZZY = 6
+
+    def _is_duplicate(norm_sig: str, token_set: Set[str]) -> bool:
         """
         A candidate is a duplicate if its signature exactly matches one already
-        kept, OR is a substantial substring/superstring of one already kept.
+        kept, OR is a substantial substring/superstring of one already kept, OR
+        its content-token set overlaps an already-kept clause above
+        JACCARD_DUP_THRESHOLD.
+
         The LLM and rule-based extraction paths frequently extract the same
-        underlying clause with minor wording differences (e.g. one includes a
-        leading "Section 3.2:" fragment the other omits), so exact-match alone
-        under-deduplicates; containment catches these near-duplicates while a
-        minimum length guard avoids collapsing genuinely distinct short clauses.
+        underlying clause with minor wording differences. Exact-match alone
+        under-deduplicates; containment catches cases where one text is a
+        substring of the other (e.g. one includes a leading "Section 3.2:"
+        fragment); the fuzzy token-overlap check catches the remaining case —
+        two paraphrases of the same obligation where neither is a substring of
+        the other — which would otherwise inflate the count with the same
+        clause listed twice.
         """
         if norm_sig in seen_signatures:
             return True
-        if len(norm_sig) < 40:
-            return False
-        for kept in kept_sig_list:
-            if len(kept) < 40:
-                continue
-            if norm_sig in kept or kept in norm_sig:
-                return True
+        if len(norm_sig) >= 40:
+            for kept in kept_sig_list:
+                if len(kept) < 40:
+                    continue
+                if norm_sig in kept or kept in norm_sig:
+                    return True
+        if len(token_set) >= MIN_TOKENS_FOR_FUZZY:
+            for kept_tokens in kept_token_sets:
+                if len(kept_tokens) >= MIN_TOKENS_FOR_FUZZY and \
+                        _jaccard(token_set, kept_tokens) >= JACCARD_DUP_THRESHOLD:
+                    return True
         return False
 
-    def _remember(norm_sig: str) -> None:
+    def _remember(norm_sig: str, token_set: Set[str]) -> None:
         seen_signatures.add(norm_sig)
         kept_sig_list.append(norm_sig)
+        kept_token_sets.append(token_set)
 
     llm = LLMFactory.get_chat_model()
     batches = _create_block_batches(blocks, max_blocks_per_batch=10, max_chars_per_batch=3500)
@@ -692,13 +713,14 @@ def _extract_all_clauses(blocks: List[ExtractedBlock]) -> Tuple[List[RawClause],
                             )
                             continue
                         norm_sig = _normalize_clause_sig(c.text)
-                        if norm_sig and not _is_duplicate(norm_sig):
+                        token_set = _clause_token_set(c.text)
+                        if norm_sig and not _is_duplicate(norm_sig, token_set):
                             # Validate source_page and source_section
                             if not c.source_page or c.source_page <= 0:
                                 c.source_page = batch[0].page_number
                             if not c.source_section or c.source_section == "General":
                                 c.source_section = batch[0].section_title
-                            _remember(norm_sig)
+                            _remember(norm_sig, token_set)
                             raw_clauses.append(c)
             except Exception as e:
                 print(f"[Agent 1: Extraction] LLM clause batch error: {e}")
@@ -708,8 +730,9 @@ def _extract_all_clauses(blocks: List[ExtractedBlock]) -> Tuple[List[RawClause],
     rule_clauses = _extract_clauses_rule_based(blocks)
     for rc in rule_clauses:
         norm_sig = _normalize_clause_sig(rc.text)
-        if norm_sig and not _is_duplicate(norm_sig):
-            _remember(norm_sig)
+        token_set = _clause_token_set(rc.text)
+        if norm_sig and not _is_duplicate(norm_sig, token_set):
+            _remember(norm_sig, token_set)
             raw_clauses.append(rc)
 
     # 3. Filter out metadata/contact fragments and route evaluation-criteria
@@ -897,6 +920,49 @@ def _normalize_clause_sig(text: str) -> str:
     cleaned = re.sub(r'[^\w]', '', text.strip().lower(), flags=re.UNICODE)
     cleaned = _LEADING_ORDINAL_CLEANED_RE.sub('', cleaned)
     return cleaned[:400]
+
+
+# Minimal Arabic/English stopword set: removed before fuzzy near-duplicate
+# scoring so the overlap reflects meaningful content words, not shared
+# grammatical glue. Kept deliberately small to avoid over-merging distinct
+# clauses that legitimately share common function words.
+_DUP_STOPWORDS = {
+    "من", "في", "على", "الى", "إلى", "عن", "مع", "او", "أو", "و", "ما", "ان",
+    "أن", "لا", "قد", "هذا", "هذه", "التي", "الذي", "به", "بها", "اي", "أي",
+    "the", "of", "to", "in", "and", "or", "a", "an", "for", "on", "by", "is",
+    "be", "that", "this", "with", "as", "at", "any", "shall", "must",
+}
+
+
+def _clause_token_set(text: str) -> Set[str]:
+    """
+    Tokenizes a clause into a normalized, diacritics-stripped, lowercased set of
+    content tokens for fuzzy (Jaccard) near-duplicate detection. Short tokens and
+    a small stopword list are removed so the overlap score reflects meaningful
+    content words rather than grammatical glue.
+
+    This complements the exact/containment signature check: the LLM and
+    rule-based extraction paths often produce the SAME underlying obligation
+    with re-ordered or lightly reworded phrasing where neither text is a
+    substring of the other, so containment misses them and they wrongly
+    survive as two separate requirements (the "same clause counted twice"
+    inflation). A high token-overlap ratio catches those, while a conservative
+    threshold and a minimum-token guard avoid collapsing genuinely distinct
+    clauses that merely share vocabulary.
+    """
+    stripped = _strip_arabic_diacritics(text).lower()
+    raw = re.findall(r'[\w؀-ۿ]+', stripped, flags=re.UNICODE)
+    return {t for t in raw if len(t) >= 2 and t not in _DUP_STOPWORDS}
+
+
+def _jaccard(a: Set[str], b: Set[str]) -> float:
+    """Token-set Jaccard similarity; 0.0 when either set is empty."""
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    if not inter:
+        return 0.0
+    return inter / len(a | b)
 
 
 def _sanitize_metadata(meta: RFPMetadata) -> RFPMetadata:
